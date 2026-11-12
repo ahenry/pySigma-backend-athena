@@ -186,7 +186,94 @@ def test_athena_cidr_query(athena_backend: athenaBackend):
         """
             )
         )
-        == [r"SELECT * FROM <TABLE> WHERE LOWER(field) LIKE '192.168.%' ESCAPE '\'"]
+        == [
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('192.168.0.0/16', TRY_CAST(field AS IPADDRESS)), FALSE)"
+        ]
+    )
+
+
+def test_athena_cidr_prefixes(athena_backend: athenaBackend):
+    assert (
+        athena_backend.convert(SigmaCollection.from_yaml("""
+            title: CIDR Prefix Lengths
+            status: test
+            logsource:
+                product: test_product
+            detection:
+                non_octet:
+                    address|cidr: 192.168.0.0/17
+                host:
+                    address|cidr: 192.168.0.1/32
+                default_route:
+                    address|cidr: 0.0.0.0/0
+                ipv6:
+                    address|cidr: '2001:db8::/33'
+                ipv6_host:
+                    address|cidr: '2001:db8::1/128'
+                ipv6_default_route:
+                    address|cidr: '::/0'
+                condition:
+                    - non_octet
+                    - host
+                    - default_route
+                    - ipv6
+                    - ipv6_host
+                    - ipv6_default_route
+        """))
+        == [
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('192.168.0.0/17', TRY_CAST(address AS IPADDRESS)), FALSE)",
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('192.168.0.1/32', TRY_CAST(address AS IPADDRESS)), FALSE)",
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('0.0.0.0/0', TRY_CAST(address AS IPADDRESS)), FALSE)",
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('2001:db8::/33', TRY_CAST(address AS IPADDRESS)), FALSE)",
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('2001:db8::1/128', TRY_CAST(address AS IPADDRESS)), FALSE)",
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('::/0', TRY_CAST(address AS IPADDRESS)), FALSE)",
+        ]
+    )
+
+
+def test_athena_cidr_quoted_and_map_fields(athena_backend: athenaBackend):
+    assert (
+        athena_backend.convert(SigmaCollection.from_yaml("""
+            title: CIDR Quoted And Map Fields
+            status: test
+            logsource:
+                product: test_product
+            detection:
+                quoted:
+                    source.ip-address|cidr: 192.168.0.0/25
+                mapped:
+                    unmapped.source_ip|cidr: 192.168.0.0/25
+                condition:
+                    - quoted
+                    - mapped
+        """))
+        == [
+            """SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('192.168.0.0/25', TRY_CAST(source."ip-address" AS IPADDRESS)), FALSE)""",
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('192.168.0.0/25', TRY_CAST(element_at(unmapped, 'source_ip') AS IPADDRESS)), FALSE)",
+        ]
+    )
+
+
+def test_athena_cidr_list_and_negation(athena_backend: athenaBackend):
+    assert (
+        athena_backend.convert(SigmaCollection.from_yaml("""
+            title: CIDR List And Negation
+            status: test
+            logsource:
+                product: test_product
+            detection:
+                sel:
+                    address|cidr:
+                        - 192.168.0.0/25
+                        - '2001:db8::/33'
+                condition:
+                    - sel
+                    - not sel
+        """))
+        == [
+            "SELECT * FROM <TABLE> WHERE COALESCE(CONTAINS('192.168.0.0/25', TRY_CAST(address AS IPADDRESS)), FALSE) OR COALESCE(CONTAINS('2001:db8::/33', TRY_CAST(address AS IPADDRESS)), FALSE)",
+            "SELECT * FROM <TABLE> WHERE NOT (COALESCE(CONTAINS('192.168.0.0/25', TRY_CAST(address AS IPADDRESS)), FALSE) OR COALESCE(CONTAINS('2001:db8::/33', TRY_CAST(address AS IPADDRESS)), FALSE))",
+        ]
     )
 
 
@@ -501,7 +588,7 @@ def test_athena_complex_combination(athena_backend: athenaBackend):
             )
         )
         == [
-            r"SELECT * FROM <TABLE> WHERE REGEXP_LIKE(fieldA, 'Foo.*bar') AND LOWER(fieldB) LIKE '%baz%' ESCAPE '\' OR LOWER(fieldC) LIKE '10.%' ESCAPE '\' AND LOWER(fieldD) LIKE '%suffix' ESCAPE '\'"
+            r"SELECT * FROM <TABLE> WHERE REGEXP_LIKE(fieldA, 'Foo.*bar') AND LOWER(fieldB) LIKE '%baz%' ESCAPE '\' OR COALESCE(CONTAINS('10.0.0.0/8', TRY_CAST(fieldC AS IPADDRESS)), FALSE) AND LOWER(fieldD) LIKE '%suffix' ESCAPE '\'"
         ]
     )
 

@@ -1,4 +1,5 @@
 import re
+from copy import copy
 from typing import Any, ClassVar, Dict, Optional, Pattern, Tuple, Union
 
 from sigma.conditions import (
@@ -18,7 +19,10 @@ from sigma.rule import SigmaRule
 from sigma.types import (
     SigmaCasedString,
     SigmaCompareExpression,
+    SigmaExists,
     SigmaFieldReference,
+    SigmaNull,
+    SigmaQueryExpression,
     SigmaString,
     SpecialChars,
 )
@@ -50,6 +54,7 @@ class athenaBaseBackend(TextQueryBackend):
             collect_errors: If True, collect errors during conversion instead of raising them.
             table: Optional, the name of the table to include in the SQL statement.
             fields: Optional, the name of the fields to select in the SQL statement. Defaults to *.
+            array_fields: Array paths, as a list or comma-separated string. Pipeline state overrides this option.
             **backend_options: Additional backend-specific options.
         """
         super().__init__(processing_pipeline, collect_errors, **backend_options)
@@ -63,6 +68,139 @@ class athenaBaseBackend(TextQueryBackend):
             self._element_at_fields = [
                 e.strip() for e in self._element_at_fields.split(",")
             ]
+
+        self._array_fields = self._validate_array_fields(
+            backend_options.get("array_fields", [])
+        )
+
+    @staticmethod
+    def _validate_array_fields(value: object) -> list[str]:
+        if isinstance(value, str):
+            value = [field.strip() for field in value.split(",")]
+        if not isinstance(value, list) or not all(
+            isinstance(field, str) and field and field.strip() == field
+            for field in value
+        ):
+            raise ValueError("array_fields must be a list of non-empty field paths")
+        for field in value:
+            if any(other != field and field.startswith(other + ".") for other in value):
+                raise ValueError("Nested array_fields are not supported")
+        return value
+
+    def _array_field(
+        self, field: str, state: ConversionState
+    ) -> Optional[Tuple[str, str]]:
+        fields = self._validate_array_fields(
+            state.processing_state.get("array_fields", self._array_fields)
+        )
+        for array in fields:
+            if field == array:
+                return array, ""
+            if field.startswith(array + "."):
+                return array, field[len(array) + 1 :]
+        return None
+
+    def _array_predicate(
+        self,
+        cond: Union[ConditionFieldEqualsValueExpression, ConditionOR, ConditionAND],
+        array: str,
+        member: str,
+        state: ConversionState,
+    ) -> str:
+        alias = "_sigma_element"
+        while (
+            alias in re.split(r"(?<!\\)\.", array) or alias in self._element_at_fields
+        ):
+            alias += "_"
+        element_field = alias + ("." + member if member else "")
+        element_state = ConversionState(
+            deferred=state.deferred,
+            processing_state={
+                **state.processing_state,
+                "array_fields": [],
+                "contains_special": False,
+            },
+        )
+        element_cond = copy(cond)
+        if isinstance(element_cond, ConditionFieldEqualsValueExpression):
+            element_cond.field = element_field
+            predicate = super().convert_condition_field_eq_val(
+                element_cond, element_state
+            )
+        else:
+            element_cond.args = []
+            for arg in cond.args:
+                if not isinstance(arg, ConditionFieldEqualsValueExpression):
+                    raise TypeError(
+                        "Array IN expressions require field-value conditions"
+                    )
+                element_arg = copy(arg)
+                element_arg.field = element_field
+                element_cond.args.append(element_arg)
+            if isinstance(element_cond.args[0].value, SigmaString):
+                predicate = self.convert_condition_as_in_expression(
+                    element_cond, element_state
+                )
+            else:
+                predicate = super().convert_condition_as_in_expression(
+                    element_cond, element_state
+                )
+        if not isinstance(predicate, str):
+            raise NotImplementedError("Deferred array predicates are not supported")
+        return (
+            f"COALESCE(ANY_MATCH({self.escape_and_quote_field(array)}, "
+            f"{alias} -> {predicate}), FALSE)"
+        )
+
+    def convert_condition_field_eq_val(
+        self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
+    ) -> Union[str, DeferredQueryExpression]:
+        array_field = self._array_field(cond.field, state)
+        if isinstance(cond.value, SigmaFieldReference) and (
+            array_field or self._array_field(cond.value.field, state)
+        ):
+            raise NotImplementedError("Array field references are not supported")
+        if array_field:
+            array, member = array_field
+            if isinstance(cond.value, (SigmaNull, SigmaExists)):
+                if member:
+                    raise NotImplementedError(
+                        "Null and existence checks on array members are not supported"
+                    )
+            elif isinstance(cond.value, SigmaQueryExpression):
+                raise NotImplementedError(
+                    "Query expressions on array fields are not supported"
+                )
+            else:
+                return self._array_predicate(cond, array, member, state)
+        return super().convert_condition_field_eq_val(cond, state)
+
+    def decide_convert_condition_as_in_expression(
+        self, cond: Union[ConditionOR, ConditionAND], state: ConversionState
+    ) -> bool:
+        if not super().decide_convert_condition_as_in_expression(cond, state):
+            return False
+        if self._array_field(cond.args[0].field, state):
+            return (
+                len(
+                    {
+                        (
+                            isinstance(arg.value, SigmaString),
+                            isinstance(arg.value, SigmaCasedString),
+                        )
+                        for arg in cond.args
+                    }
+                )
+                == 1
+            )
+        return True
+
+    def convert_condition_field_eq_val_cidr(
+        self, cond: ConditionFieldEqualsValueExpression, state: ConversionState
+    ) -> Union[str, DeferredQueryExpression]:
+        quoted_cond = copy(cond)
+        quoted_cond.field = self.escape_and_quote_field(cond.field)
+        return super().convert_condition_field_eq_val_cidr(quoted_cond, state)
 
     # ----------------------------------------------------------------------------------------------------------
     # General Setup
@@ -119,6 +257,10 @@ class athenaBaseBackend(TextQueryBackend):
     re_escape: ClassVar[Tuple[str]] = ()
     re_escape_escape_char: bool = True
     re_flag_prefix: bool = False
+
+    cidr_expression: ClassVar[str] = (
+        "COALESCE(CONTAINS('{value}', TRY_CAST({field} AS IPADDRESS)), FALSE)"
+    )
 
     # Case-sensitive string matching
     case_sensitive_match_expression: ClassVar[str] = "{field} = {value}"
@@ -286,6 +428,9 @@ class athenaBaseBackend(TextQueryBackend):
         Returns:
             The converted query string or deferred expression.
         """
+        array_field = self._array_field(cond.args[0].field, state)
+        if array_field:
+            return self._array_predicate(cond, *array_field, state)
         field = self.escape_and_quote_field(cond.args[0].field)
         if not isinstance(cond.args[0].value, SigmaCasedString):
             field = f"LOWER({field})"

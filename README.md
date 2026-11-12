@@ -23,6 +23,17 @@ functions—aren't implemented; see the Limitations section below.
 - Full-text searches (value-only expressions) are not supported.
 - At present, only the `event_count` correlation rule type is supported.
 
+### CIDR matching
+
+The `cidr` modifier uses Trino's native
+`CONTAINS(network, TRY_CAST(field AS IPADDRESS))`, supporting arbitrary IPv4 and
+IPv6 prefix lengths rather than string-prefix matching. This applies to scalar
+fields and array elements alike. Malformed or null addresses count as no match
+using `COALESCE(..., FALSE)`; negated CIDR selections therefore include them.
+Fields must have a type that can be cast to `IPADDRESS`, such as `VARCHAR`.
+The target engine must support the `CONTAINS(VARCHAR, IPADDRESS)` overload
+(available in Athena engine version 3).
+
 ---
 
 [//]: # (## Installation)
@@ -173,6 +184,93 @@ If no `fields` are specified in the rule, the query defaults to `SELECT *`.
 This feature is automatically applied when converting rules with the backend.
 
 ---
+
+## Array Fields
+
+Declare one-level array paths with the `array_fields` backend option:
+
+```python
+backend = athenaBackend(array_fields=["dns.answers", "tags"])
+```
+
+The CLI accepts a comma-separated list:
+
+```shell
+sigma convert -t athena -O array_fields=dns.answers,tags rules/
+```
+
+A field equal to a configured array path matches scalar elements. A field below
+that path matches a member of each struct element. For example, after a field
+mapping from `answers` to `dns.answers.name`, this detection:
+
+```yaml
+selection:
+  answers:
+    - '127.0.0.1'
+    - '0.0.0.0'
+condition: selection
+```
+
+produces this predicate:
+
+```sql
+COALESCE(
+    ANY_MATCH(
+        dns.answers,
+        _sigma_element -> LOWER(_sigma_element.name) IN ('127.0.0.1', '0.0.0.0')
+    ),
+    FALSE
+)
+```
+
+For log-source-specific schemas, use the standard pySigma `set_state`
+transformation. The backend-specific `array_fields` state value overrides the
+backend option for that rule; an empty list disables array matching:
+
+```yaml
+name: Route53 array mapping
+transformations:
+  - id: answers_mapping
+    type: field_name_mapping
+    mapping:
+      answers: dns.answers.name
+    rule_conditions:
+      - type: logsource
+        product: aws
+        service: route53
+  - id: route53_arrays
+    type: set_state
+    key: array_fields
+    val:
+      - dns.answers
+    rule_conditions:
+      - type: logsource
+        product: aws
+        service: route53
+```
+
+Configure paths **after field mapping**. Array metadata describes the schema;
+it does not change the fields selected by the query.
+
+Array value predicates reuse scalar conversion for strings, case-sensitive
+strings, wildcards, regex, CIDR, numbers, booleans, and supported comparisons.
+Values must be compatible with the SQL element/member type; no implicit
+stringification is added. Ordinary lists match any listed value in any element.
+The `all` modifier generates separate `ANY_MATCH` predicates joined with `AND`,
+so different elements can satisfy different values. Likewise, conditions on
+different struct members do not implicitly require the same element to match.
+
+Empty arrays do not match value predicates. Null arrays and null predicate
+results with no matching element also count as no match, via `COALESCE(...,
+FALSE)`. Consequently, negating a value selection matches when no element
+matches, including empty and null arrays. This null handling is intentional and
+does not change existing scalar predicates.
+
+Null and existence checks on the array itself retain the existing `IS NULL` /
+`IS NOT NULL` behavior: an empty array exists. Null/existence checks on projected
+struct members, field references involving arrays, and query-expression values
+on arrays are not supported and raise errors. Nested configured arrays are
+rejected. Fields not covered by an array path retain scalar conversion.
 
 ## Supported Correlation Rules
 
