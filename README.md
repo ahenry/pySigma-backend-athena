@@ -181,6 +181,16 @@ SELECT uid, time_dt, process.command_line as command_line FROM ...
 
 If no `fields` are specified in the rule, the query defaults to `SELECT *`.
 
+When a selected field uses a configured map root, the backend aliases the
+projection with the mapped Sigma field name as one SQL identifier. For example,
+with `element_at_fields=["labels"]`, selecting `labels.foo` produces:
+
+```sql
+element_at(labels, 'foo') AS "labels.foo"
+```
+
+An explicit alias such as `labels.foo as label` is preserved.
+
 This feature is automatically applied when converting rules with the backend.
 
 ---

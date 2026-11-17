@@ -524,12 +524,38 @@ class athenaBaseBackend(TextQueryBackend):
         match = re.search(r"\s(as)\s", field, flags=re.IGNORECASE)
         if match:
             start, end = match.span()
-            field_name = self.escape_and_quote_field(field[:start])
+            map_field = self._map_select_field(field[:start])
+            if map_field is None:
+                field_name = self.escape_and_quote_field(field[:start])
+            else:
+                field_name = map_field[0]
             seperator = field[start:end]
             field_as = self.escape_and_quote_field(field[end:])
             return field_name + seperator + field_as
 
+        map_field = self._map_select_field(field)
+        if map_field is not None:
+            return f'{map_field[0]} AS {self._quote_select_identifier(map_field[1])}'
+
         return self.escape_and_quote_field(field)
+
+    def _map_select_field(self, field: str) -> Optional[Tuple[str, str]]:
+        parts = [p.replace(r"\.", ".") for p in re.split(r"(?<!\\)\.", field)]
+        if parts[0] not in self._element_at_fields or len(parts) < 2:
+            return None
+
+        key = ".".join(parts[1:])
+        escaped_key = key.replace(self.str_quote, self.str_quote * 2)
+        expression = (
+            f"element_at({self._quote_select_identifier(parts[0])}, "
+            f"{self.quote_string(escaped_key)})"
+        )
+        return expression, ".".join(parts)
+
+    def _quote_select_identifier(self, field_name: str) -> str:
+        if self.field_quote is not None:
+            field_name = field_name.replace(self.field_quote, self.field_quote * 2)
+        return super().escape_and_quote_field(field_name)
 
     # ----------------------------------------------------------------------------------------------------------
 
